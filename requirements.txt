@@ -1,0 +1,15 @@
+# Ana GUI kütüphanesi
+PyQt6>=6.5.0
+
+# Veritabanı işlemleri için
+# SQLite Python'un standart kütüphanesinde olduğu için ekstra yükleme gerektirmez
+
+# Grafikler için
+pyqtgraph>=0.13.3
+numpy>=1.24.0
+
+# Tarih işlemleri için
+python-dateutil>=2.8.2
+
+# Tema ve stil için (opsiyonel)
+qt-material>=2.14 
