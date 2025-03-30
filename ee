@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Kredi Kartı Takip Uygulaması - Kredi Kartları Modülü
+"""
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
+    QTableView, QHeaderView, QFrame, QDialog, QLineEdit, 
+    QFormLayout, QComboBox, QSpinBox, QDoubleSpinBox, 
+    QTextEdit, QMessageBox, QToolButton, QTabWidget,
+    QSplitter, QDialogButtonBox, QCheckBox
+)
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Signal, Slot
+from PySide6.QtGui import QIcon, QPixmap, QColor, QFont, QCursor
+import re
+from datetime import datetime
+
+from models.models import KrediKarti, EkKart
+from controllers.credit_card_controller import CreditCardController
+from sqlalchemy.orm import Session
+
+class KrediKartlariModel(QAbstractTableModel):
+    """Kredi kartları için tablo modeli"""
+    
+    def __init__(self, cards=None, parent=None):
+        super().__init__(parent)
+        self.cards = cards or []
+        self.headers = ["ID", "Kart Hamili", "Kart No", "Banka", "Kart Tipi", "Limit", "Kullanılabilir", "Hesap Kesim", "Ödeme Tarihi"]
+    
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.cards)
+    
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.headers)
+    
+    def data(self, index, role):
+        if not index.isValid() or not (0 <= index.row() < len(self.cards)):
+            return None
+        
+        card = self.cards[index.row()]
+        col = index.column()
+        
+        if role == Qt.ItemDataRole.DisplayRole:
+            if col == 0:
+                return str(card.id)
+            elif col == 1:
+                return card.kart_hamili
+            elif col == 2:
+                # Kart numarasını formatlı göster (XXXX XXXX XXXX XXXX)
+                if len(card.kart_numarasi) == 16:
+                    return f"{card.kart_numarasi[:4]} {card.kart_numarasi[4:8]} {card.kart_numarasi[8:12]} {card.kart_numarasi[12:16]}"
+                else:
+                    return card.kart_numarasi
+            elif col == 3:
+                return card.banka_adi
+            elif col == 4:
+                return card.kart_tipi
+            elif col == 5:
+                return f"{card.limit:,.2f} TL"
+            elif col == 6:
+                return f"{card.kullanilabilir_limit:,.2f} TL"
+            elif col == 7:
+                return f"Her ayın {card.hesap_kesim_tarihi}. günü"
+            elif col == 8:
+                return f"Her ayın {card.odeme_tarihi}. günü"
+        
+        elif role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in [0, 5, 6, 7, 8]:
+                return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        
+        elif role == Qt.ItemDataRole.FontRole:
+            font = QFont()
+            if col in [1, 3, 4]:
+                font.setBold(True)
+            return font
+        
+        elif role == Qt.ItemDataRole.ForegroundRole:
+            if col == 6:
+                if card.kullanilabilir_limit < card.limit * 0.1:
+                    return QColor("#dc3545")  # Kırmızı (limit az)
+                elif card.kullanilabilir_limit < card.limit * 0.3:
+                    return QColor("#fd7e14")  # Turuncu (limit azalıyor)
+            return QColor("#212529")  # Normal metin rengi
+    
+    def headerData(self, section, orientation, role):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self.headers[section]
+        return None
+    
+    def update_data(self, cards):
+        self.beginResetModel()
+        self.cards = cards
+        self.endResetModel()
+
+
+class KartEkleDuzenleDialog(QDialog):
+    """Kredi kartı ekleme/düzenleme dialog'u"""
+    
+    def __init__(self, parent=None, card=None, controller=None, user_id=None):
+        super().__init__(parent)
+        self.card = card
+        self.controller = controller
+        self.user_id = user_id
+        self.setup_ui()
+        
+        if card:
+            self.setWindowTitle("Kredi Kartı Düzenle")
+            self.fill_form_data()
+        else:
+            self.setWindowTitle("Yeni Kredi Kartı Ekle")
+    
+    def setup_ui(self):
+        """Dialog arayüzünü oluşturur"""
+        self.setMinimumWidth(450)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8f9fa;
+            }
+            QLabel {
+                font-weight: 500;
+                color: #343a40;
+            }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+                padding: 8px;
+                background-color: white;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {
+                border: 1px solid #6c5ce7;
+            }
+            QPushButton {
+                background-color: #6c5ce7;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5b4ecc;
+            }
+            QPushButton:pressed {
+                background-color: #4b3db2;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        
+        # Form düzeni
+        form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+        form_layout.setContentsMargins(0, 0, 0, 20)
+        
+        # Kart hamili
+        self.kart_hamili_input = QLineEdit()
+        self.kart_hamili_input.setPlaceholderText("Kart Hamili Adı")
+        form_layout.addRow("Kart Hamili:", self.kart_hamili_input)
+        
+        # Kart numarası (16 haneli)
+        self.kart_numarasi_input = QLineEdit()
+        self.kart_numarasi_input.setPlaceholderText("XXXX XXXX XXXX XXXX")
+        self.kart_numarasi_input.setMaxLength(19)  # 16 rakam + 3 boşluk
+        self.kart_numarasi_input.textChanged.connect(self.format_card_number)
+        form_layout.addRow("Kart Numarası:", self.kart_numarasi_input)
+        
+        # Banka adı
+        self.banka_adi_input = QComboBox()
+        self.banka_adi_input.setEditable(True)
+        self.banka_adi_input.addItems([
+            "Ziraat Bankası", "Halk Bankası", "Vakıfbank", "İş Bankası", 
+            "Akbank", "Yapı Kredi", "Garanti BBVA", "QNB Finansbank", 
+            "Denizbank", "TEB", "Şekerbank", "ING", "HSBC", "Odeabank"
+        ])
+        form_layout.addRow("Banka Adı:", self.banka_adi_input)
+        
+        # Kart tipi
+        self.kart_tipi_input = QComboBox()
+        self.kart_tipi_input.setEditable(True)
+        self.kart_tipi_input.addItems([
+            "Bonus", "World", "Maximum", "Axess", "CardFinans", 
+            "Wings", "Miles&Smiles", "Paraf", "Advantage"
+        ])
+        form_layout.addRow("Kart Tipi:", self.kart_tipi_input)
+        
+        # Kart türü
+        self.kart_turu_input = QComboBox()
+        self.kart_turu_input.addItems(["Şahıs", "Business"])
+        form_layout.addRow("Kart Türü:", self.kart_turu_input)
+        
+        # Hesap kesim tarihi
+        self.hesap_kesim_input = QSpinBox()
+        self.hesap_kesim_input.setRange(1, 31)
+        self.hesap_kesim_input.setValue(1)
+        form_layout.addRow("Hesap Kesim Tarihi:", self.hesap_kesim_input)
+        
+        # Ödeme gün süresi
+        self.odeme_gun_suresi_input = QSpinBox()
+        self.odeme_gun_suresi_input.setRange(1, 30)
+        self.odeme_gun_suresi_input.setValue(10)
+        form_layout.addRow("Ödeme Gün Süresi:", self.odeme_gun_suresi_input)
+        
+        # Ödeme tarihi hesaplama
+        odeme_tarihi_layout = QHBoxLayout()
+        self.hesap_kesim_input.valueChanged.connect(self.update_odeme_tarihi)
+        self.odeme_gun_suresi_input.valueChanged.connect(self.update_odeme_tarihi)
+        
+        odeme_tarihi_label = QLabel("Ödeme Tarihi:")
+        self.odeme_tarihi_sonuc = QLabel("Hesaplanıyor...")
+        self.odeme_tarihi_sonuc.setStyleSheet("font-weight: bold; color: #6c5ce7;")
+        
+        odeme_tarihi_layout.addWidget(odeme_tarihi_label)
+        odeme_tarihi_layout.addWidget(self.odeme_tarihi_sonuc)
+        
+        # Limit
+        self.limit_input = QDoubleSpinBox()
+        self.limit_input.setRange(0, 1000000)
+        self.limit_input.setSingleStep(100)
+        self.limit_input.setPrefix("")
+        self.limit_input.setSuffix(" TL")
+        self.limit_input.setDecimals(2)
+        self.limit_input.setGroupSeparatorShown(True)
+        form_layout.addRow("Limit:", self.limit_input)
+        
+        # Açıklama
+        self.aciklama_input = QTextEdit()
+        self.aciklama_input.setPlaceholderText("Kart hakkında notlar...")
+        self.aciklama_input.setMaximumHeight(80)
+        form_layout.addRow("Açıklama:", self.aciklama_input)
+        
+        layout.addLayout(form_layout)
+        layout.addLayout(odeme_tarihi_layout)
+        layout.addSpacing(20)
+        
+        # Butonlar
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Kaydet")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("İptal")
+        
+        layout.addWidget(buttons)
+        
+        # İlk hesaplamayı yap
+        self.update_odeme_tarihi()
+    
+    def format_card_number(self, text):
+        """Kart numarasını otomatik formatlar (XXXX XXXX XXXX XXXX)"""
+        text = re.sub(r'[^0-9]', '', text)  # Sadece rakamları al
+        
+        # 4'erli gruplar halinde formatla
+        result = ""
+        for i, char in enumerate(text):
+            if i > 0 and i % 4 == 0:
+                result += " "
+            result += char
+        
+        # Eğer metin değiştiyse, yeni metni ayarla
+        if result != text:
+            self.kart_numarasi_input.blockSignals(True)
+            self.kart_numarasi_input.setText(result)
+            self.kart_numarasi_input.setCursorPosition(len(result))
+            self.kart_numarasi_input.blockSignals(False)
+    
+    def update_odeme_tarihi(self):
+        """Hesap kesim tarihi ve ödeme gün süresine göre ödeme tarihini hesaplar"""
+        hesap_kesim = self.hesap_kesim_input.value()
+        odeme_gun_suresi = self.odeme_gun_suresi_input.value()
+        
+        # Ödeme tarihini hesapla (basit versiyon: hesap kesim + ödeme gün süresi)
+        odeme_gunu = (hesap_kesim + odeme_gun_suresi) % 31
+        if odeme_gunu == 0:
+            odeme_gunu = 31
+        
+        self.odeme_tarihi_sonuc.setText(f"Her ayın {odeme_gunu}. günü")
+    
+    def fill_form_data(self):
+        """Düzenleme modu için form alanlarını doldurur"""
+        if not self.card:
+            return
+        
+        self.kart_hamili_input.setText(self.card.kart_hamili)
+        
+        # Kart numarasını formatlı göster
+        card_number = self.card.kart_numarasi
+        if len(card_number) == 16:
+            formatted = f"{card_number[:4]} {card_number[4:8]} {card_number[8:12]} {card_number[12:16]}"
+            self.kart_numarasi_input.setText(formatted)
+        else:
+            self.kart_numarasi_input.setText(card_number)
+        
+        # Banka ve kart tipi
+        if self.card.banka_adi:
+            index = self.banka_adi_input.findText(self.card.banka_adi)
+            if index >= 0:
+                self.banka_adi_input.setCurrentIndex(index)
+            else:
+                self.banka_adi_input.setCurrentText(self.card.banka_adi)
+        
+        if self.card.kart_tipi:
+            index = self.kart_tipi_input.findText(self.card.kart_tipi)
+            if index >= 0:
+                self.kart_tipi_input.setCurrentIndex(index)
+            else:
+                self.kart_tipi_input.setCurrentText(self.card.kart_tipi)
+        
+        # Kart türü
+        index = self.kart_turu_input.findText(self.card.kart_turu)
+        if index >= 0:
+            self.kart_turu_input.setCurrentIndex(index)
+        
+        # Tarihler
+        self.hesap_kesim_input.setValue(self.card.hesap_kesim_tarihi)
+        self.odeme_gun_suresi_input.setValue(self.card.odeme_gun_suresi)
+        
+        # Limit
+        self.limit_input.setValue(self.card.limit)
+        
+        # Açıklama
+        if self.card.aciklama:
+            self.aciklama_input.setText(self.card.aciklama)
+    
+    def get_form_data(self):
+        """Form verilerini dict olarak döndürür"""
+        return {
+            'kart_hamili': self.kart_hamili_input.text().strip(),
+            'kart_numarasi': self.kart_numarasi_input.text().strip(),
+            'banka_adi': self.banka_adi_input.currentText().strip(),
+            'kart_tipi': self.kart_tipi_input.currentText().strip(),
+            'kart_turu': self.kart_turu_input.currentText(),
+            'hesap_kesim_tarihi': self.hesap_kesim_input.value(),
+            'odeme_gun_suresi': self.odeme_gun_suresi_input.value(),
+            'limit': self.limit_input.value(),
+            'aciklama': self.aciklama_input.toPlainText().strip()
+        }
+    
+    def accept(self):
+        """Form gönderildiğinde veri doğrulama yapar"""
+        data = self.get_form_data()
+        
+        # Gerekli alanları kontrol et
+        if not data['kart_hamili']:
+            QMessageBox.warning(self, "Hata", "Kart hamili adı zorunludur!")
+            return
+        
+        # Kart numarası kontrolü
+        card_number = re.sub(r'\s+', '', data['kart_numarasi'])
+        if not card_number.isdigit() or len(card_number) != 16:
+            QMessageBox.warning(self, "Hata", "Kart numarası 16 haneli olmalıdır!")
+            return
+        
+        # Banka adı kontrolü
+        if not data['banka_adi']:
+            QMessageBox.warning(self, "Hata", "Banka adı zorunludur!")
+            return
+        
+        # Kart limitinin pozitif olması
+        if data['limit'] <= 0:
+            QMessageBox.warning(self, "Hata", "Kart limiti sıfırdan büyük olmalıdır!")
+            return
+        
+        # Tüm kontroller geçildi, formu kabul et
+        super().accept()
+
+
+class KrediKartlariWidget(QWidget):
+    """Kredi Kartları modülü ana widget'ı"""
+    
+    def __init__(self, db_session: Session, user_id: int, parent=None):
+        super().__init__(parent)
+        self.db = db_session
+        self.user_id = user_id
+        self.controller = CreditCardController(db_session)
+        
+        self.setup_ui()
+        self.load_cards()
+    
+    def setup_ui(self):
+        """Arayüzü oluşturur"""
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # Üst beyaz alan (boş, sadece estetik için)
+        top_space = QFrame()
+        top_space.setStyleSheet("background-color: white;")
+        top_space.setFixedHeight(200)
+        main_layout.addWidget(top_space)
+        
+        # Ana içerik bölümü
+        content_frame = QFrame()
+        content_frame.setObjectName("content_frame")
+        content_frame.setStyleSheet("""
+            #content_frame {
+                background-color: #f8f9fa;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+            }
+        """)
+        content_layout = QVBoxLayout(content_frame)
+        content_layout.setContentsMargins(20, 20, 20, 20)
+        content_layout.setSpacing(20)
+        
+        # Başlık ve butonlar
+        header_layout = QHBoxLayout()
+        
+        self.title_label = QLabel("Kredi Kartlarım")
+        self.title_label.setStyleSheet("font-size: 24px; font-weight: 700; color: #343a40;")
+        
+        # Ekleme ve filtreleme butonları
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(10)
+        
+        self.yeni_kart_button = QPushButton("+ Yeni Kart Ekle")
+        self.yeni_kart_button.setStyleSheet("""
+            QPushButton {
+                background-color: #6c5ce7;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5b4ecc;
+            }
+        """)
+        self.yeni_kart_button.clicked.connect(self.yeni_kart_ekle)
+        
+        self.filtre_button = QPushButton("Filtrele")
+        self.filtre_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f8f9fa;
+                color: #343a40;
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background-color: #e9ecef;
+            }
+        """)
+        
+        # Pasif kartları göster checkbox
+        self.show_inactive_checkbox = QCheckBox("Pasif Kartları Göster")
+        self.show_inactive_checkbox.setChecked(False)
+        self.show_inactive_checkbox.toggled.connect(self.load_cards)
+        
+        buttons_layout.addWidget(self.yeni_kart_button)
+        buttons_layout.addWidget(self.filtre_button)
+        buttons_layout.addWidget(self.show_inactive_checkbox)
+        
+        header_layout.addWidget(self.title_label)
+        header_layout.addStretch()
+        header_layout.addLayout(buttons_layout)
+        
+        content_layout.addLayout(header_layout)
+        
+        # Kart tablosu
+        self.cards_table = QTableView()
+        self.cards_table.setAlternatingRowColors(True)
+        self.cards_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.cards_table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.cards_table.setStyleSheet("""
+            QTableView {
+                border: 1px solid #e9ecef;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QTableView::item {
+                padding: 8px;
+            }
+            QTableView::item:selected {
+                background-color: #e9ecef;
+                color: #212529;
+            }
+            QHeaderView::section {
+                background-color: #f8f9fa;
+                border: none;
+                border-bottom: 1px solid #e9ecef;
+                padding: 8px;
+                font-weight: bold;
+            }
+        """)
+        
+        # Model oluştur
+        self.cards_model = KrediKartlariModel()
+        
+        # Proxy model ile sıralama ve filtreleme
+        self.proxy_model = QSortFilterProxyModel()
+        self.proxy_model.setSourceModel(self.cards_model)
+        
+        self.cards_table.setModel(self.proxy_model)
+        self.cards_table.setSortingEnabled(True)
+        
+        # Sütun genişliklerini ayarla
+        self.cards_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.cards_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # ID
+        
+        # Çift tıklama bağlantısı
+        self.cards_table.doubleClicked.connect(self.kart_duzenle)
+        
+        content_layout.addWidget(self.cards_table)
+        
+        # İşlem butonları
+        actions_layout = QHBoxLayout()
+        
+        self.duzenle_button = QPushButton("Düzenle")
+        self.duzenle_button.clicked.connect(self.kart_duzenle)
+        
+        self.sil_button = QPushButton("Sil")
+        self.sil_button.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+        """)
+        self.sil_button.clicked.connect(self.kart_sil)
+        
+        actions_layout.addStretch()
+        actions_layout.addWidget(self.duzenle_button)
+        actions_layout.addWidget(self.sil_button)
+        
+        content_layout.addLayout(actions_layout)
+        
+        # Ana düzene ekle
+        main_layout.addWidget(content_frame, 1)
+    
+    def load_cards(self):
+        """Kredi kartları verilerini yükler"""
+        include_inactive = self.show_inactive_checkbox.isChecked()
+        cards = self.controller.get_all_cards(self.user_id, include_inactive)
+        self.cards_model.update_data(cards)
+        
+        # ID sütununu gizle
+        self.cards_table.setColumnHidden(0, True)
+    
+    def get_selected_card_id(self):
+        """Seçili kartın ID'sini döndürür"""
+        indexes = self.cards_table.selectedIndexes()
+        if not indexes:
+            return None
+        
+        # Proxy model üzerinden gerçek model indeksini al
+        proxy_index = indexes[0]
+        source_index = self.proxy_model.mapToSource(proxy_index)
+        row = source_index.row()
+        
+        # ID değerini al (0. sütun)
+        id_index = self.cards_model.index(row, 0)
+        return int(self.cards_model.data(id_index, Qt.ItemDataRole.DisplayRole))
+    
+    def yeni_kart_ekle(self):
+        """Yeni kart ekleme dialog'unu gösterir"""
+        dialog = KartEkleDuzenleDialog(self, None, self.controller, self.user_id)
+        result = dialog.exec()
+        
+        if result == QDialog.DialogCode.Accepted:
+            # Kart verilerini al ve controller ile oluştur
+            card_data = dialog.get_form_data()
+            self.controller.create_card(self.user_id, card_data)
+            
+            # Tabloyu güncelle
+            self.load_cards()
+            
+            QMessageBox.information(self, "Başarılı", "Kredi kartı başarıyla eklendi.")
+    
+    def kart_duzenle(self):
+        """Seçili kartı düzenler"""
+        card_id = self.get_selected_card_id()
+        if not card_id:
+            QMessageBox.warning(self, "Uyarı", "Lütfen düzenlemek için bir kart seçin.")
+            return
+        
+        # Kartı getir
+        card = self.controller.get_card_by_id(card_id, self.user_id)
+        if not card:
+            QMessageBox.critical(self, "Hata", "Seçili kart bulunamadı.")
+            return
+        
+        # Düzenleme dialog'unu göster
+        dialog = KartEkleDuzenleDialog(self, card, self.controller, self.user_id)
+        result = dialog.exec()
+        
+        if result == QDialog.DialogCode.Accepted:
+            # Kart verilerini al ve controller ile güncelle
+            card_data = dialog.get_form_data()
+            self.controller.update_card(card_id, self.user_id, card_data)
+            
+            # Tabloyu güncelle
+            self.load_cards()
+            
+            QMessageBox.information(self, "Başarılı", "Kredi kartı başarıyla güncellendi.")
+    
+    def kart_sil(self):
+        """Seçili kartı siler"""
+        card_id = self.get_selected_card_id()
+        if not card_id:
+            QMessageBox.warning(self, "Uyarı", "Lütfen silmek için bir kart seçin.")
+            return
+        
+        # Silme onayı iste
+        reply = QMessageBox.question(
+            self, "Kart Silme Onayı", 
+            "Seçili kartı silmek istediğinize emin misiniz?\nBu işlem geri alınamaz.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Kartı tamamen silmek yerine pasif duruma getir
+            success = self.controller.delete_card(card_id, self.user_id, hard_delete=False)
+            
+            if success:
+                self.load_cards()
+                QMessageBox.information(self, "Başarılı", "Kredi kartı başarıyla pasif duruma getirildi.")
+            else:
+                QMessageBox.critical(self, "Hata", "Kart silme işlemi sırasında bir hata oluştu.") 
